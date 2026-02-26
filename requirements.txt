@@ -1,4 +1,7 @@
 streamlit
 pandas
-requests
 beautifulsoup4
+requests
+pytz
+st-gsheets-connection
+
