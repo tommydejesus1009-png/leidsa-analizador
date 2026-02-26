@@ -4,7 +4,8 @@ from collections import Counter
 
 def analizar_frecuencias(df):
     if df is None or df.empty: return pd.DataFrame()
-    df['Fecha'] = pd.to_datetime(df['Fecha'])
+    df['Fecha'] = pd.to_datetime(df['Fecha'], errors='coerce')
+    df = df.dropna(subset=['Fecha']) 
     df_moderno = df[df['Fecha'] >= '2024-03-01']
     if df_moderno.empty: return pd.DataFrame()
     bolas = df_moderno[['Bola_1', 'Bola_2', 'Bola_3', 'Bola_4', 'Bola_5', 'Bola_6']].values.flatten()
@@ -12,46 +13,44 @@ def analizar_frecuencias(df):
     for i in range(1, 41):
         if i not in conteo: conteo[i] = 0
     df_frec = pd.DataFrame(conteo.items(), columns=['Bola', 'Apariciones'])
-    df_frec['Bola'] = df_frec['Bola'].astype(str) 
+    df_frec['Bola'] = df_frec['Bola'].astype(str)
     return df_frec.sort_values(by='Bola', key=lambda col: col.astype(int)).reset_index(drop=True)
 
-def evaluar_combinacion(combinacion, rango_suma, descartar_pares, descartar_terminaciones, descartar_consecutivos, historial_sets):
-    """La guillotina de filtros matemáticos ampliada."""
+def evaluar_combinacion(combinacion, rango_suma, descartar_pares, descartar_terminaciones, descartar_consecutivos, historial_sets, jugadas_previas_sets):
+    if set(combinacion) in historial_sets: return False
+    if set(combinacion) in jugadas_previas_sets: return False
     
-    # 1. FILTRO ANTI-CLONES (Jugadas Ganadoras Pasadas)
-    if set(combinacion) in historial_sets: 
-        return False
-        
-    # 2. Rango de Suma
     suma = sum(combinacion)
     if not (rango_suma[0] <= suma <= rango_suma[1]): return False
-    
-    # 3. Pares e Impares
-    if descartar_pares:
-        pares = sum(1 for num in combinacion if num % 2 == 0)
-        if pares == 0 or pares == 6: return False
         
-    # 4. Terminaciones
+    pares = sum(1 for n in combinacion if n % 2 == 0)
+    impares = 6 - pares
+    if descartar_pares and (pares == 6 or impares == 6 or pares == 5 or impares == 5): return False
+        
     if descartar_terminaciones:
-        terminaciones = [num % 10 for num in combinacion]
-        for digito in range(10):
-            if terminaciones.count(digito) > 2: return False
+        terminaciones = [n % 10 for n in combinacion]
+        conteo_term = Counter(terminaciones)
+        if any(count >= 3 for count in conteo_term.values()): return False
             
-    # 5. FILTRO ANTI-CONSECUTIVOS (Ej: 14, 15, 16)
     if descartar_consecutivos:
-        for i in range(len(combinacion) - 2):
-            if combinacion[i] + 1 == combinacion[i+1] and combinacion[i] + 2 == combinacion[i+2]:
-                return False
-                
+        consecutivos = 1
+        max_consecutivos = 1
+        for i in range(1, 6):
+            if combinacion[i] == combinacion[i-1] + 1:
+                consecutivos += 1
+                if consecutivos > max_consecutivos: max_consecutivos = consecutivos
+            else:
+                consecutivos = 1
+        if max_consecutivos >= 3: return False
+            
     return True
 
-def generar_jugadas_optimas(df_historial, cantidad=5, rango_suma=(80, 150), descartar_pares=True, descartar_terminaciones=True, descartar_consecutivos=True, descartar_historico=True):
+def generar_predicciones(df_historial, cantidad, rango_suma, descartar_pares, descartar_terminaciones, descartar_consecutivos, filtro_historico, jugadas_previas_sets):
     jugadas_aprobadas = []
     intentos = 0
-    
-    # Pre-cargar el historial para el Filtro Anti-Clones
     historial_sets = []
-    if descartar_historico and not df_historial.empty:
+    
+    if filtro_historico and not df_historial.empty:
         bolas_hist = df_historial[['Bola_1', 'Bola_2', 'Bola_3', 'Bola_4', 'Bola_5', 'Bola_6']].values
         historial_sets = [set(fila) for fila in bolas_hist]
     
@@ -62,26 +61,21 @@ def generar_jugadas_optimas(df_historial, cantidad=5, rango_suma=(80, 150), desc
             bolas_calientes = df_ordenado['Bola'].head(15).astype(int).tolist()
             bolas_restantes = df_ordenado['Bola'].tail(25).astype(int).tolist()
         else:
-            bolas_calientes = list(range(1, 41))
-            bolas_restantes = list(range(1, 41))
+            bolas_calientes, bolas_restantes = list(range(1, 41)), list(range(1, 41))
     else:
-        bolas_calientes = list(range(1, 41))
-        bolas_restantes = list(range(1, 41))
+        bolas_calientes, bolas_restantes = list(range(1, 41)), list(range(1, 41))
 
     while len(jugadas_aprobadas) < cantidad and intentos < 150000:
         intentos += 1
         seleccion = random.sample(bolas_calientes, 4) + random.sample(bolas_restantes, 2)
         bolas = sorted(seleccion)
         
-        if evaluar_combinacion(bolas, rango_suma, descartar_pares, descartar_terminaciones, descartar_consecutivos, historial_sets):
+        if evaluar_combinacion(bolas, rango_suma, descartar_pares, descartar_terminaciones, descartar_consecutivos, historial_sets, jugadas_previas_sets):
             loto_mas = random.randint(1, 12)
             super_mas = random.randint(1, 15)
-            fila = {
-                "B1": bolas[0], "B2": bolas[1], "B3": bolas[2], 
-                "B4": bolas[3], "B5": bolas[4], "B6": bolas[5],
-                "Loto Más": loto_mas, "Súper Más": super_mas,
-                "Suma Total": sum(bolas)
-            }
-            jugadas_aprobadas.append(fila)
+            suma_total = sum(bolas)
+            jugadas_aprobadas.append(bolas + [loto_mas, super_mas, suma_total])
+            jugadas_previas_sets.append(set(bolas))
             
-    return pd.DataFrame(jugadas_aprobadas)
+    columnas = ['Bola_1', 'Bola_2', 'Bola_3', 'Bola_4', 'Bola_5', 'Bola_6', 'Loto_Mas', 'Super_Mas', 'Suma']
+    return pd.DataFrame(jugadas_aprobadas, columns=columnas)
