@@ -1,8 +1,8 @@
-streamlit==1.39.0
-pandas==2.2.3
+streamlit
+pandas<2.3
 beautifulsoup4
 requests
 pytz
-st-gsheets-connection==0.0.4
-gspread==5.12.4
-google-auth==2.35.0
+st-gsheets-connection
+gspread
+google-auth
