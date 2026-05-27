@@ -3,8 +3,18 @@ import requests
 from bs4 import BeautifulSoup
 import os
 import re
+from datetime import datetime, timedelta
 
 RUTA_CSV = os.path.join(os.path.dirname(__file__), '..', 'data', 'historial_loto.csv')
+
+URL_LOTO_MAS = "https://www.conectate.com.do/loterias/leidsa/loto-mas"
+URL_PORTADA = "https://www.conectate.com.do/loterias/leidsa"
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+}
 
 MESES_ES = {
     'enero': '01', 'febrero': '02', 'marzo': '03', 'abril': '04',
@@ -12,82 +22,153 @@ MESES_ES = {
     'septiembre': '09', 'octubre': '10', 'noviembre': '11', 'diciembre': '12'
 }
 
-def normalizar_fecha(texto):
-    """Convierte 'Miércoles 18 de Febrero 2026' a '2026-02-18'."""
+
+def inferir_anio(dia, mes, hoy=None):
+    """Si el (dia-mes) sería futuro con el año actual, asume año anterior."""
+    if hoy is None:
+        hoy = datetime.now()
+    try:
+        candidato = datetime(hoy.year, int(mes), int(dia))
+    except ValueError:
+        return None
+    # Tolerancia de 2 días para que sorteos de hoy/ayer no se cuenten como año pasado
+    if candidato > hoy + timedelta(days=2):
+        candidato = datetime(hoy.year - 1, int(mes), int(dia))
+    return candidato.strftime('%Y-%m-%d')
+
+
+def normalizar_fecha_texto(texto):
+    """Convierte 'Miércoles 18 de Febrero 2026' o '2026-02-18' a ISO."""
     if not texto:
         return None
-    txt = texto.lower().strip()
+    txt = str(texto).lower().strip()
+
+    # Formato ISO ya válido
+    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', txt)
+    if m:
+        return m.group(0)
+
+    # "18 de febrero 2026" o "18 de febrero de 2026"
     m = re.search(r'(\d{1,2})\s+de\s+([a-záéíóú]+)(?:\s+de)?\s+(\d{4})', txt)
     if m:
         dia, mes_nombre, anio = m.group(1), m.group(2), m.group(3)
         mes = MESES_ES.get(mes_nombre)
         if mes:
             return f"{anio}-{mes}-{dia.zfill(2)}"
-    m2 = re.search(r'(\d{4})-(\d{2})-(\d{2})', txt)
-    if m2:
-        return m2.group(0)
+
     return None
 
-def extraer_historial_web():
-    """Escanea conectate.com.do y extrae sorteos del Loto Leidsa con fechas normalizadas."""
-    url = "https://www.conectate.com.do/loterias/leidsa"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-    respuesta = requests.get(url, headers=headers, timeout=15)
-    if respuesta.status_code != 200:
-        raise Exception(f"Error de conexión: Código {respuesta.status_code}")
+def extraer_de_loto_mas():
+    """Scraper de la página dedicada de Loto Más. Patrón: 'DD-MM\\n## ## ## ## ## ## ## ##'."""
+    r = requests.get(URL_LOTO_MAS, headers=HEADERS, timeout=15)
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code} en página Loto Más")
 
-    soup = BeautifulSoup(respuesta.text, 'html.parser')
-    bloques = soup.find_all('div', class_='game-block')
+    soup = BeautifulSoup(r.text, 'html.parser')
+    texto = soup.get_text(separator='\n')
+
+    # Patrón: fecha DD-MM seguida (con espacios/saltos) por 8 números de 2 dígitos
+    patron = re.compile(
+        r'(\d{1,2})-(\d{1,2})\s*\n+\s*'
+        r'(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})'
+    )
 
     historial = []
-    for bloque in bloques:
-        texto = bloque.text.lower()
-        if 'loto' not in texto or 'pool' in texto or 'pega' in texto:
-            continue
-        if 'loto leidsa' not in texto and 'loto más' not in texto and 'loto mas' not in texto:
-            continue
+    fechas_vistas = set()
+    hoy = datetime.now()
 
-        # Fecha (normalizada a ISO)
-        texto_crudo = bloque.text
-        fecha_norm = None
-        m = re.search(
-            r'(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)[^\d]*?(\d{1,2}\s+de\s+[a-záéíóú]+\s+(?:de\s+)?\d{4})',
-            texto_crudo, re.IGNORECASE
-        )
-        if m:
-            fecha_norm = normalizar_fecha(m.group(2))
-        if not fecha_norm:
-            div_fecha = bloque.find('div', class_='session-date')
-            if div_fecha:
-                fecha_norm = normalizar_fecha(div_fecha.text.strip())
-
-        if not fecha_norm:
+    for m in patron.finditer(texto):
+        dia, mes = m.group(1), m.group(2)
+        fecha_iso = inferir_anio(dia, mes, hoy)
+        if not fecha_iso or fecha_iso in fechas_vistas:
             continue
 
-        # Bolas
-        bolas_html = bloque.find_all(['span', 'div'], class_=['score', 'ball', 'numero'])
-        if not bolas_html:
-            bolas_html = bloque.find_all('span')
+        bolas = [int(m.group(i)) for i in range(3, 11)]
+        # Validación: las 6 primeras entre 1-40, loto_mas 1-12, super_mas 1-15
+        if not all(1 <= b <= 40 for b in bolas[:6]):
+            continue
+        if not (1 <= bolas[6] <= 12):
+            continue
+        if not (1 <= bolas[7] <= 15):
+            continue
+        # No duplicados internos en las 6 bolas
+        if len(set(bolas[:6])) != 6:
+            continue
 
-        numeros = [int(b.text.strip()) for b in bolas_html if b.text.strip().isdigit()]
+        fechas_vistas.add(fecha_iso)
+        historial.append([fecha_iso] + bolas)
 
-        if len(numeros) >= 6:
-            bolas_base = numeros[0:6]
-            loto_mas = numeros[6] if len(numeros) > 6 else 0
-            super_mas = numeros[7] if len(numeros) > 7 else 0
-            historial.append([fecha_norm] + bolas_base + [loto_mas, super_mas])
-
-    if not historial:
-        raise Exception("No se encontraron sorteos del Loto en la página.")
     return historial
 
+
+def extraer_de_portada():
+    """Fallback: portada de leidsa, busca línea de Loto Más."""
+    r = requests.get(URL_PORTADA, headers=HEADERS, timeout=15)
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code} en portada")
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    texto = soup.get_text(separator='\n')
+
+    historial = []
+    hoy = datetime.now()
+
+    # En la portada: "16-05\n[Loto - Loto Más]...\n03 14 18 20 29 32 09 12"
+    patron = re.compile(
+        r'(\d{1,2})-(\d{1,2})[^\n]*\n[^\n]*?[Ll]oto[^\n]*?[Mm][áa]s[^\n]*\n'
+        r'(?:[^\n]*\n)?'  # línea opcional intermedia
+        r'(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})',
+        re.IGNORECASE
+    )
+
+    for m in patron.finditer(texto):
+        dia, mes = m.group(1), m.group(2)
+        fecha_iso = inferir_anio(dia, mes, hoy)
+        if not fecha_iso:
+            continue
+        bolas = [int(m.group(i)) for i in range(3, 11)]
+        if not all(1 <= b <= 40 for b in bolas[:6]):
+            continue
+        if len(set(bolas[:6])) != 6:
+            continue
+        historial.append([fecha_iso] + bolas)
+
+    return historial
+
+
+def extraer_historial_web():
+    """Intenta primero la página dedicada, luego la portada como fallback."""
+    errores = []
+    try:
+        datos = extraer_de_loto_mas()
+        if datos:
+            return datos
+        errores.append("Loto Más: sin coincidencias")
+    except Exception as e:
+        errores.append(f"Loto Más: {e}")
+
+    try:
+        datos = extraer_de_portada()
+        if datos:
+            return datos
+        errores.append("Portada: sin coincidencias")
+    except Exception as e:
+        errores.append(f"Portada: {e}")
+
+    raise Exception(" | ".join(errores))
+
+
 def actualizar_csv():
-    """Combina sorteos nuevos con el CSV sin duplicar."""
+    """Sincroniza con la web y guarda solo sorteos nuevos."""
     try:
         resultados = extraer_historial_web()
+        if not resultados:
+            return False, "No se extrajeron sorteos."
+
         columnas = ["Fecha", "Bola_1", "Bola_2", "Bola_3", "Bola_4", "Bola_5", "Bola_6", "Loto_Mas", "Super_Mas"]
         df_nuevos = pd.DataFrame(resultados, columns=columnas)
+        df_nuevos['Fecha'] = df_nuevos['Fecha'].astype(str)
 
         os.makedirs(os.path.dirname(RUTA_CSV), exist_ok=True)
 
@@ -99,17 +180,20 @@ def actualizar_csv():
                 df_final = pd.concat([df_filtrado, df_hist], ignore_index=True)
                 df_final = df_final.drop_duplicates(subset=['Fecha']).sort_values(by='Fecha', ascending=False)
                 df_final.to_csv(RUTA_CSV, index=False)
-                return True, f"¡Éxito! {len(df_filtrado)} sorteos nuevos agregados."
-            return True, "Todo al día. Sin sorteos nuevos."
+                fechas = ", ".join(df_filtrado['Fecha'].tolist())
+                return True, f"✅ {len(df_filtrado)} sorteos nuevos: {fechas}"
+            return True, f"Todo al día. Web devolvió {len(df_nuevos)} sorteos, todos ya estaban."
         else:
             df_nuevos = df_nuevos.sort_values(by='Fecha', ascending=False)
             df_nuevos.to_csv(RUTA_CSV, index=False)
             return True, f"Archivo creado con {len(df_nuevos)} sorteos."
+
     except Exception as e:
         return False, f"Error al extraer: {e}"
 
+
 def cargar_datos():
-    """Carga el CSV histórico, asegurando que Fecha sea string ISO."""
+    """Carga el CSV histórico con tipos correctos."""
     if not os.path.exists(RUTA_CSV):
         return pd.DataFrame()
     df = pd.read_csv(RUTA_CSV)
