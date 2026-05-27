@@ -3,6 +3,5 @@ pandas<2.3
 beautifulsoup4
 requests
 pytz
-st-gsheets-connection
 gspread
 google-auth
