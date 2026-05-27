@@ -3,9 +3,12 @@ import pandas as pd
 import datetime
 import pytz
 import json
-from streamlit_gsheets import GSheetsConnection
 import modulos.scraper as scraper
 import modulos.fisica_filtros as filtros
+
+# gspread directo (sin st_gsheets_connection)
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Leidsa Analyzer PRO", page_icon="🎯", layout="wide")
 
@@ -13,8 +16,16 @@ COLS_BOVEDA = ['Fecha Generada', 'Socio', 'Bola_1', 'Bola_2', 'Bola_3',
                'Bola_4', 'Bola_5', 'Bola_6', 'Loto_Mas', 'Super_Mas', 'Suma']
 BOLAS_COLS = ['Bola_1', 'Bola_2', 'Bola_3', 'Bola_4', 'Bola_5', 'Bola_6']
 
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 if 'memoria_temporal' not in st.session_state:
     st.session_state.memoria_temporal = pd.DataFrame(columns=COLS_BOVEDA)
+if 'error_gsheets' not in st.session_state:
+    st.session_state.error_gsheets = None
+
 
 def normalizar_fecha_iso(texto):
     if not texto:
@@ -27,34 +38,113 @@ def normalizar_fecha_iso(texto):
     except Exception:
         return None
 
-# --- CONEXIÓN GOOGLE SHEETS ---
-df_gsheets = pd.DataFrame(columns=COLS_BOVEDA)
-conn = None
-url_sheet = None
-modo_celular = True
 
-try:
-    url_sheet = st.secrets["GSHEET_URL"]
-    if "GCP_JSON" in st.secrets:
-        creds_json = json.loads(st.secrets["GCP_JSON"])
-        conn = st.connection("gsheets", type=GSheetsConnection, service_account_info=creds_json)
-    else:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-    df_raw = conn.read(spreadsheet=url_sheet)
-    df_raw.columns = [c.strip() for c in df_raw.columns]
-    df_gsheets = df_raw.reindex(columns=COLS_BOVEDA)
-    modo_celular = False
-except Exception:
-    modo_celular = True
+# ============ CONEXIÓN GOOGLE SHEETS (directa con gspread) ============
+
+def extraer_sheet_id(url):
+    """Saca el ID de cualquier URL de Google Sheets."""
+    if not url:
+        return None
+    import re
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+    return m.group(1) if m else url
+
+
+@st.cache_resource(ttl=300)
+def conectar_gsheets():
+    """Devuelve el worksheet conectado, o None + guarda el error."""
+    try:
+        if "GSHEET_URL" not in st.secrets:
+            st.session_state.error_gsheets = "Falta GSHEET_URL en Secrets"
+            return None
+        if "GCP_JSON" not in st.secrets:
+            st.session_state.error_gsheets = "Falta GCP_JSON en Secrets"
+            return None
+
+        url = st.secrets["GSHEET_URL"]
+        sheet_id = extraer_sheet_id(url)
+
+        creds_raw = st.secrets["GCP_JSON"]
+        if isinstance(creds_raw, str):
+            creds_dict = json.loads(creds_raw)
+        else:
+            creds_dict = dict(creds_raw)
+
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(sheet_id)
+        ws = sh.sheet1
+        return ws
+    except json.JSONDecodeError as e:
+        st.session_state.error_gsheets = f"JSON mal formado: {e}"
+        return None
+    except gspread.exceptions.APIError as e:
+        st.session_state.error_gsheets = f"API Google: {e}"
+        return None
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.session_state.error_gsheets = "Sheet no encontrado. ¿Compartiste el Sheet con el email del service account como Editor?"
+        return None
+    except Exception as e:
+        st.session_state.error_gsheets = f"{type(e).__name__}: {e}"
+        return None
+
+
+def leer_boveda_gsheet(ws):
+    """Lee todas las filas del worksheet como DataFrame."""
+    try:
+        registros = ws.get_all_records()
+        df = pd.DataFrame(registros)
+        if df.empty:
+            return pd.DataFrame(columns=COLS_BOVEDA)
+        df = df.reindex(columns=COLS_BOVEDA)
+        return df
+    except Exception as e:
+        st.session_state.error_gsheets = f"Error leyendo: {e}"
+        return pd.DataFrame(columns=COLS_BOVEDA)
+
+
+def escribir_boveda_gsheet(ws, df):
+    """Sobrescribe todo el worksheet con el DataFrame."""
+    try:
+        ws.clear()
+        if df.empty:
+            ws.update([COLS_BOVEDA])
+        else:
+            data = [COLS_BOVEDA] + df[COLS_BOVEDA].astype(object).where(pd.notnull(df[COLS_BOVEDA]), "").values.tolist()
+            ws.update(data)
+        return True
+    except Exception as e:
+        st.session_state.error_gsheets = f"Error escribiendo: {e}"
+        return False
+
+
+# Conectar
+ws = conectar_gsheets()
+modo_celular = ws is None
+
+if not modo_celular:
+    df_gsheets = leer_boveda_gsheet(ws)
+else:
+    df_gsheets = pd.DataFrame(columns=COLS_BOVEDA)
 
 df_boveda = pd.concat([df_gsheets, st.session_state.memoria_temporal], ignore_index=True)
 df_boveda = df_boveda.dropna(subset=['Bola_1']).drop_duplicates().reset_index(drop=True)
 
+# ============ UI ============
+
 st.title("🎯 Leidsa Analyzer PRO")
 if modo_celular:
-    st.caption("📱 Modo Celular — guardado local (conecta la llave Google para nube)")
+    st.caption("📱 Modo Celular — guardado local")
+    with st.expander("⚠️ Detalles del error de conexión a Google Sheets", expanded=False):
+        st.code(st.session_state.error_gsheets or "Sin detalles")
+        st.markdown("""
+**Checklist:**
+1. ¿Compartiste el Sheet con el email del service account como **Editor**?
+2. ¿Activaste **Google Sheets API** y **Google Drive API** en Google Cloud?
+3. ¿El `GCP_JSON` en Secrets está completo entre `'''` triples comillas?
+        """)
 else:
-    st.caption("☁️ Conectado a Google Sheets — guardado permanente activo")
+    st.caption("☁️ Conectado a Google Sheets")
 
 tz_rd = pytz.timezone('America/Santo_Domingo')
 hoy_rd = datetime.datetime.now(tz_rd)
@@ -68,7 +158,7 @@ if not df_historial.empty:
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuración")
-    if st.button("🔄 Sincronizar Leidsa", use_container_width=True):
+    if st.button("🔄 Sincronizar Leidsa", width='stretch'):
         with st.spinner("Actualizando..."):
             exito, mensaje = scraper.actualizar_csv()
             if exito:
@@ -103,7 +193,7 @@ with st.sidebar:
     filtro_historico = st.checkbox("Anti-Clones (no repetir ganadores)", value=True)
 
     st.divider()
-    if st.button("🧹 Limpiar memoria temporal", use_container_width=True):
+    if st.button("🧹 Limpiar memoria temporal", width='stretch'):
         st.session_state.memoria_temporal = pd.DataFrame(columns=COLS_BOVEDA)
         st.success("Memoria limpia")
         st.rerun()
@@ -146,6 +236,24 @@ st.divider()
 
 tab1, tab2, tab3, tab4 = st.tabs(["🔮 Individual", "🤝 Sindicato", "📂 Historial", "📊 Análisis"])
 
+
+def guardar_jugadas(df_append, etiqueta="jugadas"):
+    """Añade a memoria temporal y persiste a Google Sheets si está conectado."""
+    st.session_state.memoria_temporal = pd.concat(
+        [st.session_state.memoria_temporal, df_append], ignore_index=True
+    )
+    if not modo_celular and ws is not None:
+        df_final = pd.concat([df_gsheets, st.session_state.memoria_temporal], ignore_index=True)
+        df_final = df_final.drop_duplicates().reset_index(drop=True)
+        if escribir_boveda_gsheet(ws, df_final):
+            st.success(f"✅ {len(df_append)} {etiqueta} guardadas en Google Sheets.")
+            st.cache_resource.clear()
+        else:
+            st.warning(f"⚠️ Guardado en local. Error nube: {st.session_state.error_gsheets}")
+    else:
+        st.warning("⚠️ Modo Celular: en memoria. Toma screenshot.")
+
+
 # --- TAB 1 ---
 with tab1:
     st.subheader("Modo Francotirador")
@@ -155,7 +263,7 @@ with tab1:
     with col2:
         cant_jug = st.number_input("Cantidad", 1, 20, 5)
 
-    if st.button("🚀 Generar Jugadas", use_container_width=True, type="primary"):
+    if st.button("🚀 Generar Jugadas", width='stretch', type="primary"):
         with st.spinner("Procesando matrices..."):
             df_nuevas = filtros.generar_predicciones(
                 df_historial, cant_jug, rango_suma,
@@ -169,24 +277,11 @@ with tab1:
             filas_nuevas = []
             for _, r in df_nuevas.iterrows():
                 filas_nuevas.append([hoy_str, nombre_jug,
-                                     r['Bola_1'], r['Bola_2'], r['Bola_3'],
-                                     r['Bola_4'], r['Bola_5'], r['Bola_6'],
-                                     r['Loto_Mas'], r['Super_Mas'], r['Suma']])
+                                     int(r['Bola_1']), int(r['Bola_2']), int(r['Bola_3']),
+                                     int(r['Bola_4']), int(r['Bola_5']), int(r['Bola_6']),
+                                     int(r['Loto_Mas']), int(r['Super_Mas']), int(r['Suma'])])
             df_append = pd.DataFrame(filas_nuevas, columns=COLS_BOVEDA)
-            st.session_state.memoria_temporal = pd.concat(
-                [st.session_state.memoria_temporal, df_append], ignore_index=True
-            )
-
-            if not modo_celular and conn is not None:
-                try:
-                    df_final = pd.concat([df_gsheets, st.session_state.memoria_temporal], ignore_index=True)
-                    conn.update(spreadsheet=url_sheet, data=df_final)
-                    st.success(f"✅ {len(df_nuevas)} jugadas guardadas en Google Sheets.")
-                except Exception as e:
-                    st.warning(f"⚠️ Guardado en local. (Error nube: {e})")
-            else:
-                st.warning("⚠️ Modo Celular: en memoria. Toma screenshot.")
-
+            guardar_jugadas(df_append, "jugadas")
             st.table(df_nuevas)
 
 # --- TAB 2 ---
@@ -196,7 +291,7 @@ with tab2:
     cant_in = st.number_input("Jugadas por socio", 1, 10, 2)
     lista_socios = [n.strip() for n in nombres_in.split(",") if n.strip()]
 
-    if st.button("🔥 Forjar Bloque", use_container_width=True, type="primary"):
+    if st.button("🔥 Forjar Bloque", width='stretch', type="primary"):
         total = len(lista_socios) * cant_in
         with st.spinner(f"Generando {total} jugadas..."):
             df_nuevas = filtros.generar_predicciones(
@@ -215,26 +310,13 @@ with tab2:
                 st.table(sub_df)
                 for _, r in sub_df.iterrows():
                     filas_sindicato.append([hoy_str, socio,
-                                            r['Bola_1'], r['Bola_2'], r['Bola_3'],
-                                            r['Bola_4'], r['Bola_5'], r['Bola_6'],
-                                            r['Loto_Mas'], r['Super_Mas'], r['Suma']])
-
+                                            int(r['Bola_1']), int(r['Bola_2']), int(r['Bola_3']),
+                                            int(r['Bola_4']), int(r['Bola_5']), int(r['Bola_6']),
+                                            int(r['Loto_Mas']), int(r['Super_Mas']), int(r['Suma'])])
             df_append = pd.DataFrame(filas_sindicato, columns=COLS_BOVEDA)
-            st.session_state.memoria_temporal = pd.concat(
-                [st.session_state.memoria_temporal, df_append], ignore_index=True
-            )
+            guardar_jugadas(df_append, "jugadas del sindicato")
 
-            if not modo_celular and conn is not None:
-                try:
-                    df_final = pd.concat([df_gsheets, st.session_state.memoria_temporal], ignore_index=True)
-                    conn.update(spreadsheet=url_sheet, data=df_final)
-                    st.success("✅ Bloque registrado en Google Sheets.")
-                except Exception as e:
-                    st.warning(f"⚠️ Local. {e}")
-            else:
-                st.warning("⚠️ Modo Celular: screenshot a las jugadas.")
-
-# --- TAB 3: HISTORIAL ---
+# --- TAB 3 ---
 with tab3:
     st.subheader("📂 Bóveda de Jugadas")
 
@@ -293,7 +375,7 @@ with tab3:
             return estilos
 
         df_show = df_filtrado.sort_values(by="Fecha Generada", ascending=False)
-        st.dataframe(df_show.style.apply(resaltar, axis=1), use_container_width=True, height=400)
+        st.dataframe(df_show.style.apply(resaltar, axis=1), width='stretch', height=400)
         st.caption("🟡 Acierto individual | 🔴 MATRIZ GANADORA (6 aciertos)")
 
         st.divider()
@@ -304,9 +386,9 @@ with tab3:
             aciertos_por_socio[a['Socio']] = aciertos_por_socio.get(a['Socio'], 0) + 1
         stats_socio['Aciertos'] = stats_socio['Socio'].map(lambda s: aciertos_por_socio.get(s, 0))
         stats_socio = stats_socio.sort_values('Jugadas', ascending=False)
-        st.dataframe(stats_socio, hide_index=True, use_container_width=True)
+        st.dataframe(stats_socio, hide_index=True, width='stretch')
 
-# --- TAB 4: ANÁLISIS ---
+# --- TAB 4 ---
 with tab4:
     a1, a2 = st.columns(2)
     with a1:
@@ -314,13 +396,13 @@ with tab4:
         if not df_historial.empty:
             df_frec = filtros.analizar_frecuencias(df_historial, ventana_dias=30)
             top_cal = df_frec.sort_values('Apariciones', ascending=False).head(10)
-            st.dataframe(top_cal, hide_index=True, use_container_width=True)
+            st.dataframe(top_cal, hide_index=True, width='stretch')
 
     with a2:
         st.subheader("❄️ Top 10 Atrasados")
         if not df_historial.empty:
             df_atr = filtros.analizar_atrasados(df_historial)
-            st.dataframe(df_atr.head(10), hide_index=True, use_container_width=True)
+            st.dataframe(df_atr.head(10), hide_index=True, width='stretch')
 
     st.divider()
     st.subheader("📊 Mapa de Frecuencias Histórico")
@@ -332,4 +414,4 @@ with tab4:
     st.divider()
     st.subheader("📜 Últimos 30 sorteos oficiales")
     if not df_historial.empty:
-        st.dataframe(df_historial.head(30), hide_index=True, use_container_width=True)
+        st.dataframe(df_historial.head(30), hide_index=True, width='stretch')
