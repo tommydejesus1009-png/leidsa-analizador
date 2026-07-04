@@ -44,7 +44,7 @@ def ultimo_sorteo_esperado(ahora):
     return None
 
 
-# --- MEJORA #4: AUTO-SYNC (una vez por sesión) ---
+# --- AUTO-SYNC (una vez por sesión) ---
 if 'auto_sync_loto' not in st.session_state:
     st.session_state.auto_sync_loto = True
     with st.spinner("🔄 Sincronizando sorteos Leidsa..."):
@@ -74,7 +74,7 @@ if not df_historial.empty:
     df_historial['Fecha'] = df_historial['Fecha'].apply(normalizar_fecha_iso)
     df_historial = df_historial.dropna(subset=['Fecha'])
 
-# --- MEJORA #5: BANNER DE SORTEO ---
+# --- BANNER DE SORTEO ---
 prox = proximo_sorteo(ahora)
 if prox:
     faltan = prox - ahora
@@ -93,9 +93,11 @@ with st.sidebar:
     if st.button("🔄 Sincronizar Leidsa", width='stretch'):
         with st.spinner("Actualizando..."):
             exito, mensaje = scraper.actualizar_csv()
-            st.success(mensaje) if exito else st.error(mensaje)
             if exito:
+                st.success(mensaje)
                 st.rerun()
+            else:
+                st.error(mensaje)
 
     st.divider()
     st.subheader("📊 Stats en vivo")
@@ -176,7 +178,6 @@ def guardar_jugadas(df_append, etiqueta="jugadas"):
 
 
 def mostrar_con_score(df):
-    """Tabla con columna Score coloreada."""
     def color_score(v):
         if v >= 75:
             return 'background-color: #1B5E20; color: white'
