@@ -39,7 +39,7 @@ if 'auto_sync_kino' not in st.session_state:
         except Exception:
             pass
 
-# Conexión — hoja "Kino" del MISMO spreadsheet (se crea sola)
+# Conexión — hoja "Kino" del mismo spreadsheet (se crea sola)
 ws, err_conn = gsh.conectar_worksheet("Kino")
 modo_celular = ws is None
 df_gsheets = gsh.leer_df(ws, COLS_BOVEDA_K) if not modo_celular else pd.DataFrame(columns=COLS_BOVEDA_K)
@@ -70,9 +70,11 @@ with st.sidebar:
     if st.button("🔄 Sincronizar Kino", width='stretch'):
         with st.spinner("Actualizando..."):
             exito, msg = sk.actualizar_csv_kino()
-            st.success(msg) if exito else st.error(msg)
             if exito:
+                st.success(msg)
                 st.rerun()
+            else:
+                st.error(msg)
     st.divider()
     if not df_hist.empty:
         st.metric("Sorteos en base", len(df_hist))
