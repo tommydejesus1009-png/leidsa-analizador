@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import os
 import re
+from datetime import datetime, timedelta
 
 RUTA_CSV_KINO = os.path.join(os.path.dirname(__file__), '..', 'data', 'historial_kino.csv')
 
@@ -30,11 +31,10 @@ def extraer_de_yelu_kino():
     soup = BeautifulSoup(r.text, 'html.parser')
     texto = soup.get_text(separator='\n')
 
-    # Fecha "DD de Mes YYYY" seguida (pocas líneas después) de 20 números
+    # "DD de Mes YYYY" + texto sin dígitos + 20 números
     patron = re.compile(
-        r'(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+(\d{4})[^\n]*\n'
-        r'(?:[^\n]*\n){0,3}?'
-        r'\s*((?:\d{1,2}[\s\n]+){19}\d{1,2})',
+        r'(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+(\d{4})[^\d]{0,80}?'
+        r'((?:\d{1,2}\s+){19}\d{1,2})',
         re.IGNORECASE
     )
 
@@ -46,7 +46,9 @@ def extraer_de_yelu_kino():
         mes = MESES_ES.get(mes_nombre)
         if not mes:
             continue
-        fecha_iso = f"{anio}-{mes}-{dia.zfill(2)}"
+        # Yelu publica con fecha del día siguiente al sorteo → restamos 1 día
+        fecha_pub = datetime.strptime(f"{anio}-{mes}-{dia.zfill(2)}", '%Y-%m-%d')
+        fecha_iso = (fecha_pub - timedelta(days=1)).strftime('%Y-%m-%d')
         if fecha_iso in fechas_vistas:
             continue
 
@@ -62,7 +64,7 @@ def extraer_de_yelu_kino():
         historial.append([fecha_iso] + sorted(nums))
 
     if not historial:
-        raise Exception("yelu.do: sin coincidencias de Kino")
+        raise Exception("yelu.do Kino: sin coincidencias (¿cambió el formato?)")
     return historial
 
 
