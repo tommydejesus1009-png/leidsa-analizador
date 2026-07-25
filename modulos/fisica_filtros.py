@@ -1,4 +1,5 @@
 import random
+import math
 import pandas as pd
 from collections import Counter
 
@@ -57,40 +58,52 @@ def estadisticas_suma(df):
     if df.empty:
         return {'media': 123, 'std': 25, 'min': 60, 'max': 180}
     sumas = df[['Bola_1', 'Bola_2', 'Bola_3', 'Bola_4', 'Bola_5', 'Bola_6']].sum(axis=1)
+    std = round(float(sumas.std()), 1)
     return {
         'media': round(float(sumas.mean()), 1),
-        'std': round(float(sumas.std()), 1) or 1.0,
+        'std': std if std > 0 else 1.0,
         'min': int(sumas.min()),
         'max': int(sumas.max())
     }
 
 
+def _decenas(bolas):
+    """Cuántas decenas distintas (1-10, 11-20, 21-30, 31-40) cubre la jugada."""
+    return len(set((b - 1) // 10 for b in bolas))
+
+
 def calcular_score(bolas, calientes, atrasados, stats):
-    """Score 0-100 de qué tan 'alineada' está la jugada con el análisis."""
+    """Score 0-100: qué tan alineada está la jugada con los patrones históricos."""
     score = 0
     n_cal = sum(1 for b in bolas if b in calientes)
-    score += min(n_cal, 4) * 10                      # máx 40
+    score += min(n_cal, 4) * 9
     n_atr = sum(1 for b in bolas if b in atrasados)
     if 1 <= n_atr <= 2:
-        score += 20
+        score += 18
     elif n_atr == 3:
-        score += 10
+        score += 9
     if stats['std'] > 0:
         z = abs(sum(bolas) - stats['media']) / stats['std']
-        score += max(0, int(25 * (1 - min(z, 2) / 2)))  # máx 25
+        score += max(0, int(22 * (1 - min(z, 2) / 2)))
+    dec = _decenas(bolas)
+    if dec == 4:
+        score += 16
+    elif dec == 3:
+        score += 10
     bajos = sum(1 for b in bolas if b <= 20)
     pares = sum(1 for b in bolas if b % 2 == 0)
     if 2 <= bajos <= 4:
-        score += 8
+        score += 4
     if 2 <= pares <= 4:
-        score += 7
+        score += 4
     return min(score, 100)
 
 
 # ============ EVALUACIÓN ============
 
 def evaluar_combinacion(combinacion, rango_suma, descartar_pares, descartar_terminaciones,
-                       descartar_consecutivos, historial_sets, jugadas_previas_sets):
+                       descartar_consecutivos, historial_sets, jugadas_previas_sets,
+                       spread_decenas=True):
     if set(combinacion) in historial_sets:
         return False
     if set(combinacion) in jugadas_previas_sets:
@@ -120,6 +133,10 @@ def evaluar_combinacion(combinacion, rango_suma, descartar_pares, descartar_term
     bajos = sum(1 for n in combinacion if n <= 20)
     if bajos == 0 or bajos == 6:
         return False
+    if spread_decenas:
+        conteo_dec = Counter((n - 1) // 10 for n in combinacion)
+        if max(conteo_dec.values()) >= 4:
+            return False
     return True
 
 
@@ -127,7 +144,8 @@ def evaluar_combinacion(combinacion, rango_suma, descartar_pares, descartar_term
 
 def generar_predicciones(df_historial, cantidad, rango_suma, descartar_pares,
                          descartar_terminaciones, descartar_consecutivos,
-                         filtro_historico, jugadas_previas_sets):
+                         filtro_historico, jugadas_previas_sets,
+                         usar_gauss=True, spread_decenas=True):
     jugadas_aprobadas = []
     intentos = 0
     historial_sets = []
@@ -139,6 +157,7 @@ def generar_predicciones(df_historial, cantidad, rango_suma, descartar_pares,
     calientes = list(range(1, 41))
     atrasados = list(range(1, 41))
     stats = estadisticas_suma(df_historial)
+    mu, sigma = stats['media'], stats['std']
 
     if not df_historial.empty:
         df_frec = analizar_frecuencias(df_historial, ventana_dias=30)
@@ -150,7 +169,7 @@ def generar_predicciones(df_historial, cantidad, rango_suma, descartar_pares,
 
     todos = list(range(1, 41))
 
-    while len(jugadas_aprobadas) < cantidad and intentos < 200000:
+    while len(jugadas_aprobadas) < cantidad and intentos < 250000:
         intentos += 1
         modo = random.choice(['calientes', 'mixta', 'atrasados', 'libre'])
         try:
@@ -182,13 +201,21 @@ def generar_predicciones(df_historial, cantidad, rango_suma, descartar_pares,
         seleccion = seleccion[:6]
         bolas = sorted(seleccion)
 
-        if evaluar_combinacion(bolas, rango_suma, descartar_pares, descartar_terminaciones,
-                              descartar_consecutivos, historial_sets, jugadas_previas_sets):
-            loto_mas = random.randint(1, 12)
-            super_mas = random.randint(1, 15)
-            score = calcular_score(bolas, calientes, atrasados, stats)
-            jugadas_aprobadas.append(bolas + [loto_mas, super_mas, sum(bolas), score])
-            jugadas_previas_sets.append(set(bolas))
+        if not evaluar_combinacion(bolas, rango_suma, descartar_pares, descartar_terminaciones,
+                                   descartar_consecutivos, historial_sets, jugadas_previas_sets,
+                                   spread_decenas):
+            continue
+
+        if usar_gauss and sigma > 0:
+            factor = math.exp(-((sum(bolas) - mu) ** 2) / (2 * (sigma ** 2)))
+            if random.random() > factor:
+                continue
+
+        loto_mas = random.randint(1, 12)
+        super_mas = random.randint(1, 15)
+        score = calcular_score(bolas, calientes, atrasados, stats)
+        jugadas_aprobadas.append(bolas + [loto_mas, super_mas, sum(bolas), score])
+        jugadas_previas_sets.append(set(bolas))
 
     columnas = ['Bola_1', 'Bola_2', 'Bola_3', 'Bola_4', 'Bola_5', 'Bola_6',
                 'Loto_Mas', 'Super_Mas', 'Suma', 'Score']
