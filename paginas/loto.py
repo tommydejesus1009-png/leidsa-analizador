@@ -6,6 +6,8 @@ import pytz
 import modulos.scraper as scraper
 import modulos.fisica_filtros as filtros
 import modulos.gsheets_helper as gsh
+import modulos.wheeling as wheeling
+import modulos.analisis_avanzado as av
 
 COLS_BOVEDA = ['Fecha Generada', 'Socio', 'Bola_1', 'Bola_2', 'Bola_3',
                'Bola_4', 'Bola_5', 'Bola_6', 'Loto_Mas', 'Super_Mas', 'Suma']
@@ -116,6 +118,8 @@ with st.sidebar:
         suma_default = (max(60, int(stats['media'] - stats['std'])),
                         min(200, int(stats['media'] + stats['std'])))
     rango_suma = st.slider("Rango de Suma", 60, 200, suma_default)
+    usar_gauss = st.checkbox("Campana de Gauss (favorece suma central)", value=True)
+    spread_decenas = st.checkbox("Distribuir por decenas", value=True)
     descartar_pares = st.checkbox("Filtro Paridad (descarta 6-0)", value=True)
     descartar_terminaciones = st.checkbox("Filtro Terminaciones", value=True)
     descartar_consecutivos = st.checkbox("Filtro Consecutivos", value=True)
@@ -159,7 +163,8 @@ else:
     st.info("Radar vigilando... sin aciertos de 3+ números aún.")
 
 st.divider()
-tab1, tab2, tab3, tab4 = st.tabs(["🔮 Individual", "🤝 Sindicato", "📂 Historial", "📊 Análisis"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🔮 Individual", "🤝 Sindicato", "🎡 Rueda", "📂 Historial", "📊 Análisis"])
 
 
 def guardar_jugadas(df_append, etiqueta="jugadas"):
@@ -201,7 +206,8 @@ with tab1:
         with st.spinner("Procesando matrices..."):
             df_nuevas = filtros.generar_predicciones(
                 df_historial, cant_jug, rango_suma, descartar_pares,
-                descartar_terminaciones, descartar_consecutivos, filtro_historico, [])
+                descartar_terminaciones, descartar_consecutivos, filtro_historico, [],
+                usar_gauss=usar_gauss, spread_decenas=spread_decenas)
         if df_nuevas.empty:
             st.error("⚠️ No se pudieron generar jugadas. Afloja los filtros.")
         else:
@@ -222,7 +228,8 @@ with tab2:
         with st.spinner(f"Generando {total} jugadas..."):
             df_nuevas = filtros.generar_predicciones(
                 df_historial, total, rango_suma, descartar_pares,
-                descartar_terminaciones, descartar_consecutivos, filtro_historico, [])
+                descartar_terminaciones, descartar_consecutivos, filtro_historico, [],
+                usar_gauss=usar_gauss, spread_decenas=spread_decenas)
         if len(df_nuevas) < total:
             st.error(f"⚠️ Solo salieron {len(df_nuevas)} de {total}. Afloja filtros.")
         else:
@@ -237,6 +244,71 @@ with tab2:
             guardar_jugadas(pd.DataFrame(filas, columns=COLS_BOVEDA), "jugadas del sindicato")
 
 with tab3:
+    st.subheader("🎡 Sistema de Rueda (Wheeling)")
+    st.markdown("""
+    Reparte tu grupo de números favoritos en varios boletos de forma que,
+    **si** cierta cantidad de ellos sale, se **garantiza** al menos un premio.
+    """)
+    st.caption("⚠️ No aumenta la probabilidad de que salgan tus números (sigue siendo azar). "
+               "Optimiza cómo cubres la inversión del grupo.")
+
+    nums_txt = st.text_input("Tus números favoritos (separados por espacio o coma)",
+                             "3 7 10 14 20 24 29 35 38 40")
+    try:
+        nums_grupo = [int(x) for x in nums_txt.replace(",", " ").split() if x.strip()]
+        nums_grupo = sorted(set(n for n in nums_grupo if 1 <= n <= 40))
+    except Exception:
+        nums_grupo = []
+
+    cA, cB = st.columns(2)
+    with cA:
+        objetivo = st.selectbox("SI salen esta cantidad de mis números...",
+                                [4, 5, 6], index=0)
+    with cB:
+        garantia = st.selectbox("...garantízame al menos", [3, 4, 5], index=0)
+
+    max_bol = st.slider("Máximo de boletos", 5, 100, 40)
+
+    if st.button("🎡 Generar Rueda", width='stretch', type="primary"):
+        if len(nums_grupo) < 6:
+            st.error("Necesitas al menos 6 números.")
+        elif garantia > objetivo:
+            st.error("La garantía no puede ser mayor que los aciertos objetivo.")
+        else:
+            with st.spinner("Calculando cobertura óptima..."):
+                boletos, info = wheeling.generar_rueda(
+                    nums_grupo, garantia=garantia,
+                    aciertos_objetivo=objetivo, max_boletos=max_bol)
+
+            if info.get("error"):
+                st.error(info["error"])
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Boletos", info["n_boletos"])
+                m2.metric("Costo total", f"RD$ {info['costo']:,}")
+                m3.metric("Cobertura", f"{info['cobertura_pct']}%")
+
+                if info["completa"]:
+                    st.success(f"✅ Garantía COMPLETA: si salen {objetivo} de tus "
+                               f"{info['n_numeros']} números, tendrás mínimo {garantia} aciertos asegurados.")
+                else:
+                    st.warning(f"Cobertura parcial ({info['cobertura_pct']}%). "
+                               f"Sube el máximo de boletos para garantía completa.")
+
+                df_bol = pd.DataFrame(boletos, columns=[f"N{i}" for i in range(1, 7)])
+                df_bol.index = [f"Boleto {i+1}" for i in range(len(boletos))]
+                st.dataframe(df_bol, width='stretch')
+
+                # Guardar a bóveda opcional
+                if st.button("💾 Guardar rueda en bóveda"):
+                    filas = []
+                    for b in boletos:
+                        import random as _r
+                        filas.append([hoy_str, "Rueda"] + list(b) +
+                                     [_r.randint(1, 12), _r.randint(1, 15), sum(b)])
+                    guardar_jugadas(pd.DataFrame(filas, columns=COLS_BOVEDA), "boletos de rueda")
+
+with tab4:
     st.subheader("📂 Bóveda de Jugadas")
     if df_boveda.empty:
         st.info("Bóveda vacía.")
@@ -297,7 +369,7 @@ with tab3:
         st.dataframe(stats_socio.sort_values('Jugadas', ascending=False),
                      hide_index=True, width='stretch')
 
-with tab4:
+with tab5:
     a1, a2 = st.columns(2)
     with a1:
         st.subheader("🔥 Top 10 Calientes (30 sorteos)")
@@ -317,6 +389,32 @@ with tab4:
         df_ft = filtros.analizar_frecuencias(df_historial)
         df_ft['Bola'] = df_ft['Bola'].astype(str)
         st.bar_chart(df_ft.set_index('Bola'))
+
+    st.divider()
+    st.subheader("🔗 Pares que más salen juntos")
+    if not df_historial.empty:
+        df_pares = av.pares_frecuentes(df_historial, top=15)
+        st.dataframe(df_pares, hide_index=True, width='stretch')
+        st.caption("Parejas de números que más veces han coincidido en un mismo sorteo (por azar, pero curioso).")
+
+    st.divider()
+    st.subheader("🧪 Test de Imparcialidad (Chi-cuadrado)")
+    if not df_historial.empty:
+        res = av.test_chi_cuadrado(df_historial)
+        if res.get("error"):
+            st.info(res["error"])
+        else:
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.metric("Veredicto", res["veredicto"])
+                st.metric("Estadístico χ²", f"{res['chi2']}")
+            with cc2:
+                st.metric("Umbral 'justo' (95%)", f"< {res['critico_95']}")
+                st.caption(f"Basado en {res['sorteos']} sorteos. "
+                           f"Cada número debería salir ~{res['esperado']} veces.")
+            st.info(res["detalle"])
+            st.caption(f"📈 Más frecuente: número {res['mas_sale'][0]} ({res['mas_sale'][1]} veces) · "
+                       f"📉 Menos frecuente: número {res['menos_sale'][0]} ({res['menos_sale'][1]} veces)")
 
     st.divider()
     st.subheader("📜 Últimos 30 sorteos oficiales")
